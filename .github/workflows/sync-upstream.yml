@@ -1,0 +1,134 @@
+name: Sync upstream & deploy
+
+# 1) 定时从上游主线（OpenListTeam/OpenList-Worker）拉取更新，自动合并到 main。
+# 2) 有更新时自动重新部署 Cloudflare Worker（openlist），
+#    Secrets（JWT_SECRET / ENCRYPTION_SECRET）与 D1 绑定不受部署影响。
+#
+# 本仓库为上游镜像，正常情况应始终与上游一致，直接快进即可。
+# 若本地曾改过构建产物（cloud-functions/[[default]].js 等单行压缩 bundle），
+# git 无法三方合并，此时统一采用上游版本；其余真实源码冲突仍然报错等待人工处理。
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # UTC 04:00 = 北京时间 12:00
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "强制重新部署 Cloudflare Worker（无更新时也部署）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/OpenListTeam/OpenList-Worker.git
+          git fetch upstream --tags --prune
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "已是最新，无需同步。"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit upstream/main; then
+            # cloud-functions/[[default]].js 等是构建产物（单行压缩 bundle），无法三方合并，
+            # 统一采用上游版本；本仓库部署走 Cloudflare Workers（src/**），不依赖该产物。
+            for f in $(git diff --name-only --diff-filter=U); do
+              case "$f" in
+                cloud-functions/*|dist/*)
+                  echo "构建产物冲突，采用上游版本：$f"
+                  git checkout --theirs -- "$f"
+                  git add -- "$f"
+                  ;;
+                *)
+                  echo "::error::合并上游时发生冲突（$f），请手动解决后再推送。"
+                  exit 1
+                  ;;
+              esac
+            done
+            git commit --no-edit
+          fi
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || inputs.deploy
+    runs-on: ubuntu-latest
+    name: Deploy to Cloudflare Workers
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Fetch official frontend dist
+        run: node scripts/fetch-frontend.mjs
+
+      - name: Write wrangler config
+        run: |
+          cat > wrangler.jsonc <<'EOF'
+          {
+            "name": "openlist",
+            "main": "src/backend/worker.ts",
+            "compatibility_date": "2026-08-04",
+            "compatibility_flags": ["nodejs_compat"],
+            "workers_dev": true,
+            "preview_urls": false,
+
+            "assets": {
+              "directory": "./dist",
+              "binding": "ASSETS"
+            },
+
+            "d1_databases": [
+              {
+                "binding": "DB",
+                "database_name": "openlist",
+                "database_id": "3dedac0d-cac4-41e5-9aae-14f4efdc1894"
+              }
+            ],
+
+            "vars": {
+              "ENVIRONMENT": "production",
+              "DB_FORMAT": "sql",
+              "DB_DRIVER": "d1"
+            }
+          }
+          EOF
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CI: 1
+        run: pnpm exec wrangler deploy --keep-vars
