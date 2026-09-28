@@ -7,6 +7,11 @@ name: Sync upstream & deploy
 # 本仓库为上游镜像，正常情况应始终与上游一致，直接快进即可。
 # 若本地曾改过构建产物（cloud-functions/[[default]].js 等单行压缩 bundle），
 # git 无法三方合并，此时统一采用上游版本；其余真实源码冲突仍然报错等待人工处理。
+#
+# 本仓库的 .github/workflows/** 由 fork 自己维护，同步时一律保留本地版本：
+# GITHUB_TOKEN 是 GitHub App 身份，推送任何改动工作流文件的提交都会被服务端拒绝
+# （remote rejected: refusing to allow a GitHub App to create or update workflow），
+# 上游一旦改自己的工作流，本任务就会整体失败。
 
 on:
   schedule:
@@ -40,6 +45,7 @@ jobs:
         id: merge
         run: |
           set -e
+          PRE=$(git rev-parse HEAD)
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/OpenListTeam/OpenList-Worker.git
@@ -59,6 +65,13 @@ jobs:
                   git checkout --theirs -- "$f"
                   git add -- "$f"
                   ;;
+                .github/workflows/*)
+                  # 本仓库自有 CI 配置：无论上游是改、增还是删，一律以本地版本为准。
+                  # 注意此处只是解决冲突，真正的还原在合并提交生成之后（见下方 amend）。
+                  echo "工作流文件冲突，保留本仓库版本：$f"
+                  git checkout "$PRE" -- "$f" 2>/dev/null || git rm -q --ignore-unmatch -- "$f"
+                  git add -A -- "$f"
+                  ;;
                 *)
                   echo "::error::合并上游时发生冲突（$f），请手动解决后再推送。"
                   exit 1
@@ -66,6 +79,18 @@ jobs:
               esac
             done
             git commit --no-edit
+          fi
+          # 合并可能带进上游对工作流文件的改动，这类提交用 GITHUB_TOKEN 推不上去。
+          # 必须改写（amend）刚生成的合并提交，而不是另起一个"改回去"的提交——
+          # 后者本身也在改动工作流文件，同样会被拒绝。
+          if ! git diff --quiet "$PRE" HEAD -- .github/workflows; then
+            echo "还原上游对工作流的改动（保留本仓库自有 CI 配置）："
+            git diff --name-status "$PRE" HEAD -- .github/workflows
+            git rm -r -q --cached -- .github/workflows
+            rm -rf .github/workflows
+            git checkout "$PRE" -- .github/workflows
+            git add -A -- .github/workflows
+            git commit --amend --no-edit
           fi
           git push origin HEAD:main
           echo "changed=true" >> "$GITHUB_OUTPUT"
