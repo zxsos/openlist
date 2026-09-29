@@ -56,14 +56,22 @@ jobs:
             exit 0
           fi
           if ! git merge --no-edit upstream/main; then
-            # cloud-functions/[[default]].js 等是构建产物（单行压缩 bundle），无法三方合并，
-            # 统一采用上游版本；本仓库部署走 Cloudflare Workers（src/**），不依赖该产物。
-            for f in $(git diff --name-only --diff-filter=U); do
+            # 构建产物（单行压缩 bundle）无法三方合并，统一采用上游结果。
+            # 注意"上游已删除该文件"（modify/delete）这种冲突里上游那一版根本不存在，
+            # checkout --theirs 会报 "does not have their version" 并让 set -e 直接炸掉整步，
+            # 所以必须先判断上游版本在不在，不在就跟着删。
+            has_theirs() { git ls-files -u -- "$1" | awk '{print substr($1,1,1)}' | grep -qx 3; }
+            while IFS= read -r -d '' f; do
               case "$f" in
                 cloud-functions/*|dist/*)
-                  echo "构建产物冲突，采用上游版本：$f"
-                  git checkout --theirs -- "$f"
-                  git add -- "$f"
+                  if has_theirs "$f"; then
+                    echo "构建产物冲突，采用上游版本：$f"
+                    git checkout --theirs -- "$f"
+                    git add -A -- "$f"
+                  else
+                    echo "构建产物已被上游删除，跟随删除：$f"
+                    git rm -q --ignore-unmatch -- "$f"
+                  fi
                   ;;
                 .github/workflows/*)
                   # 本仓库自有 CI 配置：无论上游是改、增还是删，一律以本地版本为准。
@@ -77,7 +85,7 @@ jobs:
                   exit 1
                   ;;
               esac
-            done
+            done < <(git diff --name-only -z --diff-filter=U)
             git commit --no-edit
           fi
           # 合并可能带进上游对工作流文件的改动，这类提交用 GITHUB_TOKEN 推不上去。
