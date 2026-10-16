@@ -17,6 +17,14 @@ import {
   driverPreferProxy,
   normalizeDriverName,
 } from "../internal/driver/proxy"
+import {
+  cacheKindPrefix,
+  cacheListKeys,
+  clearCache,
+  clearStorageCache,
+  getCacheRuntimeStatus,
+  type CacheKind,
+} from "../internal/cache"
 
 export const adminRouter = new Hono()
 
@@ -431,6 +439,9 @@ adminRouter.post("/storage/update", async (c) => {
     }
     db.storages[idx] = updatedStorage
     await saveDb(db, c.env)
+    // 存储配置已变更（挂载路径 / root_folder_path / addition / 缓存策略等），
+    // 既有缓存全部失效，避免继续返回旧挂载点或旧凭据下的结果。
+    await clearStorageCache(updatedStorage.id, c.env)
   }
   return c.json({ code: 200, message: "success", data: null })
 })
@@ -440,6 +451,9 @@ adminRouter.post("/storage/delete", async (c) => {
   const db = await getDb(c.env)
   db.storages = db.storages.filter((s: any) => s.id !== id)
   await saveDb(db, c.env)
+  // 存储已删除：其文件树 / 下载链接缓存必须一并清理，否则 id 复用时
+  // 新存储会读到旧存储的缓存内容。
+  await clearStorageCache(id, c.env)
   return c.json({ code: 200, message: "success", data: null })
 })
 
@@ -451,6 +465,7 @@ adminRouter.post("/storage/enable", async (c) => {
     s.disabled = false
     s.modified = new Date().toISOString()
     await saveDb(db, c.env)
+    await clearStorageCache(id, c.env)
     // 异步初始化驱动（不阻塞响应）：启用多个云盘时立即返回，
     // 初始化完成后更新状态；失败时把错误写入 status，下次访问或
     // 重新加载时会再次尝试。
@@ -484,6 +499,7 @@ adminRouter.post("/storage/disable", async (c) => {
   if (s) {
     s.disabled = true
     await saveDb(db, c.env)
+    await clearStorageCache(id, c.env)
   }
   return c.json({ code: 200, message: "success", data: null })
 })
@@ -4603,12 +4619,21 @@ adminRouter.post("/setting/set_thunderx", async (c) => {
 adminRouter.post("/setting/reset_token", async (c) => {
   const newToken = generateSecureToken(32)
   await updateSettingValue(c.env, { token: newToken })
-  // `token` 设置是链接/下载签名密钥（对应 Go 的 sign.Instance()），
-  // 变更后旧的下载链接签名立即失效——与 Go ResetToken 行为一致。
+  // 本接口轮换的是 `token` 设置，即**静态 API Token**
+  // （pkg/utils.isStaticApiToken 用它比对 `Authorization: Bearer <token>`）。
   //
-  // 注意：JWT 密钥来自 env.JWT_SECRET / 持久化的 openlist_jwt_secret，与这里的
-  // `token` 设置无关，所以清 JWT 缓存**不会**让已签发的 JWT 失效；这里调用只是
-  // 让进程内缓存与最新的 env/持久化值保持一致。
+  // 关于下载链接（重要，勿再写成「旧链接立即失效」）：
+  //   下载签名由 pkg/sign 用 getJwtSecret() 计算，密钥来源是
+  //   env.JWT_SECRET 或持久化的 openlist_jwt_secret，**与 `token` 设置无关**。
+  //   因此轮换本设置**不会**让已签发的下载链接失效。
+  //   历史注释声称「与 Go ResetToken 行为一致、旧链接立即失效」，与实现不符，
+  //   会让人误以为已经撤销了旧链接。
+  //
+  // 若确实要让旧下载链接失效：需要轮换 JWT_SECRET（注意这同时会使所有已登录
+  // 会话失效）；把它做成独立开关属于后续工作，不能靠本接口悄悄生效。
+  //
+  // 这里的 resetJwtSecretCache() 只是让进程内缓存与最新 env/持久化值对齐，
+  // 并不会更换密钥，因此不会使已签发的 JWT 失效。
   const { resetJwtSecretCache } = await import("./middlewares")
   resetJwtSecretCache()
   return c.json({ code: 200, message: "success", data: newToken })
@@ -4784,6 +4809,117 @@ adminRouter.get("/kv/status", async (c) => {
     code: 200,
     message: "success",
     data: { ...statusData, store: storeStatus },
+  })
+})
+
+// --- 缓存管理（文件树缓存 / 下载链接缓存）---
+//
+// 默认只向数据库启用（CACHE_DRIVER=db）；想要改用 / 额外启用 KV、Blob 等
+// 专用后端，需显式配置 CACHE_DRIVER（如 `kv`、`db,kv`、`blob`）。
+// 这里的接口只做「查看状态 / 清空」，不改变后端选择（后端只认环境变量）。
+
+/** 缓存状态：生效配置 + 实际后端 + 当前条目数。 */
+adminRouter.get("/cache/status", async (c) => {
+  const runtime = await getCacheRuntimeStatus(c.env)
+  let fileTree = 0
+  let downloadLink = 0
+  try {
+    const [ftKeys, lnKeys] = await Promise.all([
+      cacheListKeys(cacheKindPrefix("ft", runtime.config.prefix), c.env),
+      cacheListKeys(cacheKindPrefix("ln", runtime.config.prefix), c.env),
+    ])
+    fileTree = ftKeys.length
+    downloadLink = lnKeys.length
+  } catch (err: any) {
+    return c.json({
+      code: 200,
+      message: "success",
+      data: {
+        ...runtime,
+        entries: null,
+        entries_error: safeErrorMessage(err),
+      },
+    })
+  }
+  return c.json({
+    code: 200,
+    message: "success",
+    data: {
+      ...runtime,
+      entries: {
+        file_tree: fileTree,
+        download_link: downloadLink,
+        total: fileTree + downloadLink,
+      },
+    },
+  })
+})
+
+/**
+ * 清空缓存。
+ * body: { type?: "file_tree" | "download_link" | "all", storage_id?: number }
+ * 省略 type 表示两级缓存全清；省略 storage_id 表示所有存储。
+ */
+adminRouter.post("/cache/clear", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const rawType = String(body.type ?? c.req.query("type") ?? "")
+    .trim()
+    .toLowerCase()
+  const kind: CacheKind | undefined =
+    rawType === "file_tree" || rawType === "ft" || rawType === "tree"
+      ? "ft"
+      : rawType === "download_link" || rawType === "link" || rawType === "ln"
+        ? "ln"
+        : undefined
+
+  const idRaw = body.storage_id ?? c.req.query("storage_id")
+  const hasId = idRaw !== undefined && idRaw !== null && String(idRaw) !== ""
+
+  const removed = await clearCache(c.env, {
+    ...(kind ? { kind } : {}),
+    ...(hasId ? { storageId: idRaw } : {}),
+  })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { removed, type: kind ?? "all", storage_id: hasId ? idRaw : null },
+  })
+})
+
+/**
+ * 刷新文件树缓存（对齐参考实现 OpenList.ts 的 POST /api/admin/storage/refresh）。
+ * body/query 可选 `id`：只刷新该存储。
+ */
+adminRouter.post("/storage/refresh", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const idRaw = body.id ?? c.req.query("id")
+  const hasId = idRaw !== undefined && idRaw !== null && String(idRaw) !== ""
+  const removed = await clearCache(c.env, {
+    kind: "ft",
+    ...(hasId ? { storageId: idRaw } : {}),
+  })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { removed, storage_id: hasId ? idRaw : null },
+  })
+})
+
+/**
+ * 刷新单个存储的文件树缓存
+ * （对齐参考实现 OpenList.ts 的 POST /api/admin/storage/refresh_one?id=）。
+ */
+adminRouter.post("/storage/refresh_one", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const idRaw = c.req.query("id") ?? body.id
+  if (idRaw === undefined || idRaw === null || String(idRaw) === "") {
+    return c.json({ code: 400, message: "id is required", data: null }, 400)
+  }
+  const removed = await clearCache(c.env, { kind: "ft", storageId: idRaw })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { removed, storage_id: idRaw },
   })
 })
 
